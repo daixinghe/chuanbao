@@ -1,0 +1,560 @@
+# Mooncake group 模板(Deployment 变体)—— 由 v3-sts.yaml 派生。
+# 与 v3-sts.yaml 唯一差异:RBG 的 store 角色 workload 从 StatefulSet 改为 Deployment。
+# master 角色与 etcd 仍保持 StatefulSet:
+#   * etcd:--initial-cluster 依赖 ${PREFIX}-etcd-0/1/2 稳定 pod DNS,且 volumeClaimTemplates
+#     生成的 per-pod PVC 预绑定静态 hostPath PV,只有 StatefulSet 能提供 → 必须 STS。
+#   * master:HA 靠 etcd 选主、rpc_address=$(POD_IP),无 PVC/无稳定 DNS 依赖,本可用 Deployment,
+#     但按现网约定保持 StatefulSet。
+#   * store:hostNetwork + MOONCAKE_LOCAL_HOSTNAME=$(POD_IP) 向 master 注册,无 PVC、无稳定身份依赖,
+#     故切换为 Deployment 语义上安全。
+# 注意:store 用 required podAntiAffinity(每节点至多一个 store)+ nodeAffinity 钉在打标节点,
+#   通常打标节点数 == 副本数(节点独占)。Deployment 默认 RollingUpdate 会 maxSurge 出一个多余
+#   pod 却无空闲节点可调度,模板更新(如换镜像)时滚动可能卡住;纯扩缩副本不受影响。RBG role
+#   未暴露 Deployment strategy,如需规避需在 RBG 层支持或多预留一个打标节点。
+#
+# 渲染 token(mooncake.render_template,shell 风格 ${UPPER_CASE}):
+#   ${PREFIX}          集群名前缀(由 ${MODEL}/${INDEX} 推导,如 glm51-8)
+#   ${NS}              namespace(默认 default)
+#   ${MODEL} ${INDEX}  store / master 节点 label 文法,并推导 PREFIX
+#   ${STORE_SIZE}      store 角色容量(如 1000gb),按 size 展开
+#   ${STORE_REPLICAS}  该 size 的 store 副本数
+#
+# etcd 走静态 hostPath PV(${PREFIX}-etcd-pv-0/1/2)+ 同名预绑定 PVC:复制本模板后
+# 必须把每个 PV 的 nodeAffinity hostname 空值替换为实际 etcd 节点,否则 PV 不绑、
+# etcd STS 卡 Pending。
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: ${PREFIX}-etcd-pv-0
+  labels:
+    app: ${PREFIX}-etcd
+spec:
+  capacity:
+    storage: 1Gi
+  volumeMode: Filesystem
+  accessModes:
+  - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  hostPath:
+    path: /data/k8s/local-pvs/${PREFIX}-etcd-0
+    type: DirectoryOrCreate
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: kubernetes.io/hostname
+          operator: In
+          values:
+          # 必填:复制本模板后,把下面每个 etcd PV 的空值替换为实际 etcd 节点 hostname,否则 PV 无法绑定。
+          - yichang-008
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: ${PREFIX}-etcd-pv-1
+  labels:
+    app: ${PREFIX}-etcd
+spec:
+  capacity:
+    storage: 1Gi
+  volumeMode: Filesystem
+  accessModes:
+  - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  hostPath:
+    path: /data/k8s/local-pvs/${PREFIX}-etcd-1
+    type: DirectoryOrCreate
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: kubernetes.io/hostname
+          operator: In
+          values:
+          # 必填:复制本模板后,把下面每个 etcd PV 的空值替换为实际 etcd 节点 hostname,否则 PV 无法绑定。
+          - yichang-009
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: ${PREFIX}-etcd-pv-2
+  labels:
+    app: ${PREFIX}-etcd
+spec:
+  capacity:
+    storage: 1Gi
+  volumeMode: Filesystem
+  accessModes:
+  - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  hostPath:
+    path: /data/k8s/local-pvs/${PREFIX}-etcd-2
+    type: DirectoryOrCreate
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: kubernetes.io/hostname
+          operator: In
+          values:
+          # 必填:复制本模板后,把下面每个 etcd PV 的空值替换为实际 etcd 节点 hostname,否则 PV 无法绑定。
+          - yichang-010
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ${PREFIX}-etcd-data-${PREFIX}-etcd-0
+  namespace: ${NS}
+spec:
+  accessModes:
+  - ReadWriteOnce
+  storageClassName: ""
+  volumeName: ${PREFIX}-etcd-pv-0
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ${PREFIX}-etcd-data-${PREFIX}-etcd-1
+  namespace: ${NS}
+spec:
+  accessModes:
+  - ReadWriteOnce
+  storageClassName: ""
+  volumeName: ${PREFIX}-etcd-pv-1
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ${PREFIX}-etcd-data-${PREFIX}-etcd-2
+  namespace: ${NS}
+spec:
+  accessModes:
+  - ReadWriteOnce
+  storageClassName: ""
+  volumeName: ${PREFIX}-etcd-pv-2
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${PREFIX}-etcd-headless
+  namespace: ${NS}
+  labels:
+    app: ${PREFIX}-etcd
+    # 与 etcd STS / RBG 对齐携带 part-of:aggregator 的 etcd informer 在 API server 侧
+    # 按 app.kubernetes.io/part-of=mooncake 过滤,缺此 label 资源进不了 informer。
+    app.kubernetes.io/part-of: mooncake
+spec:
+  clusterIP: None
+  ports:
+  - port: 2380
+    name: peer
+    targetPort: 2380
+  selector:
+    app: ${PREFIX}-etcd
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${PREFIX}-etcd-client
+  namespace: ${NS}
+  labels:
+    app: ${PREFIX}-etcd
+    app.kubernetes.io/part-of: mooncake
+spec:
+  type: ClusterIP
+  ports:
+  - port: 2379
+    name: client
+    targetPort: 2379
+  selector:
+    app: ${PREFIX}-etcd
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${PREFIX}-master
+  namespace: ${NS}
+  labels:
+    app: ${PREFIX}-master
+    app.kubernetes.io/part-of: mooncake
+spec:
+  type: ClusterIP
+  ports:
+  - port: 50051
+    name: rpc
+    targetPort: 50051
+  - port: 9003
+    name: metrics
+    targetPort: 9003
+  selector:
+    role: master
+    app.kubernetes.io/instance: ${PREFIX}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ${PREFIX}-etcd
+  namespace: ${NS}
+  labels:
+    app: ${PREFIX}-etcd
+    app.kubernetes.io/part-of: mooncake
+spec:
+  serviceName: ${PREFIX}-etcd-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app: ${PREFIX}-etcd
+  template:
+    metadata:
+      labels:
+        app: ${PREFIX}-etcd
+        # logtail catch-all 靠该 label 把 etcd pod 纳入 tail 集,缺则前端 last-line/FATAL 对 etcd 为空。
+        app.kubernetes.io/part-of: mooncake
+    spec:
+      affinity:
+        podAntiAffinity:
+          # etcd 靠静态 PV 的 nodeAffinity 各自钉在指定节点,3 个 pod 天然分布在 3 个节点;
+          # 这里 required 反亲和再强制每节点至多 1 个 etcd pod,与 PV 的节点分布一致。
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - ${PREFIX}-etcd
+            topologyKey: kubernetes.io/hostname
+      containers:
+      - name: etcd
+        image: 10.239.34.120:16622/mirrored-coreos-etcd:v3.5.10
+        imagePullPolicy: IfNotPresent
+        command:
+        - etcd
+        - --name=$(POD_NAME)
+        - --data-dir=/var/lib/etcd
+        - --listen-peer-urls=http://0.0.0.0:2380
+        - --listen-client-urls=http://0.0.0.0:2379
+        - --advertise-client-urls=http://$(POD_NAME).${PREFIX}-etcd-headless.$(POD_NAMESPACE).svc.cluster.local:2379
+        - --initial-advertise-peer-urls=http://$(POD_NAME).${PREFIX}-etcd-headless.$(POD_NAMESPACE).svc.cluster.local:2380
+        - --initial-cluster=${PREFIX}-etcd-0=http://${PREFIX}-etcd-0.${PREFIX}-etcd-headless.${NS}.svc.cluster.local:2380,${PREFIX}-etcd-1=http://${PREFIX}-etcd-1.${PREFIX}-etcd-headless.${NS}.svc.cluster.local:2380,${PREFIX}-etcd-2=http://${PREFIX}-etcd-2.${PREFIX}-etcd-headless.${NS}.svc.cluster.local:2380
+        - --initial-cluster-token=${PREFIX}-etcd
+        - --initial-cluster-state=new
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        ports:
+        - containerPort: 2379
+          name: client
+        - containerPort: 2380
+          name: peer
+        resources:
+          requests:
+            cpu: "1"
+            memory: "2Gi"
+          limits:
+            cpu: "2"
+            memory: "4Gi"
+        volumeMounts:
+        - name: ${PREFIX}-etcd-data
+          mountPath: /var/lib/etcd
+  # etcd 持久化:volumeClaimTemplates 生成的 PVC 名为 <template>-<sts>-<ordinal> =
+  # ${PREFIX}-etcd-data-${PREFIX}-etcd-N,与上方静态 PVC 同名,从而预绑定到对应静态 PV。
+  volumeClaimTemplates:
+  - metadata:
+      name: ${PREFIX}-etcd-data
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      storageClassName: ""
+      resources:
+        requests:
+          storage: 1Gi
+---
+apiVersion: workloads.x-k8s.io/v1alpha1
+kind: RoleBasedGroup
+metadata:
+  name: ${PREFIX}
+  namespace: ${NS}
+  labels:
+    app.kubernetes.io/part-of: mooncake
+spec:
+  roles:
+  - name: master
+    # master HA 与 etcd quorum 对齐,固定 3(etcd STS 也是 replicas: 3)。
+    replicas: 3
+    minReadySeconds: 0
+    template:
+      metadata:
+        labels:
+          role: master
+          app.kubernetes.io/instance: ${PREFIX}
+      spec:
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+              # master 迁 PD 节点、与 store 同居:node label 与 store 对称,固定 key
+              # kvcache.ai/master + value <model>_<index>_master,console 托管(创建打标 /
+              # 下线清理)。后端 parseMasterRole 只认 kvcache.ai/ 前缀的 key 才打标;
+              # 换回 controlplane 会被判为外部池不打标。
+              - matchExpressions:
+                - key: kvcache.ai/master
+                  operator: In
+                  values:
+                  - ${MODEL}_${INDEX}_master
+          podAntiAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                - key: role
+                  operator: In
+                  values:
+                  - master
+                - key: app.kubernetes.io/instance
+                  operator: In
+                  values:
+                  - ${PREFIX}
+              topologyKey: kubernetes.io/hostname
+        containers:
+        - name: master
+          image: 10.239.34.120:16622/sglang:feat-mooncache_release-72d75a994-mc-dev-c6f71f0
+          imagePullPolicy: IfNotPresent
+          command:
+          - sh
+          - -c
+          - |
+            ulimit -n 1048576
+            ulimit -l unlimited
+            mooncake_master \
+              --enable_ha=true \
+              --etcd_endpoints=http://${PREFIX}-etcd-client.${NS}.svc.cluster.local:2379 \
+              --rpc_address=$(POD_IP) \
+              --rpc_port=50051 \
+              --rpc_thread_num=16 \
+              --eviction_high_watermark_ratio=0.9 \
+              --default_kv_lease_ttl=10000
+              --allocation_strategy=local_first \
+              --enable_k8s_worker_discovery=true \
+              --enable_decode_host_affinity=true \
+              --k8s_namespace=${NS} \
+              --k8s_worker_selector='app=sglang-worker,rolebasedgroup.workloads.x-k8s.io/name=${MODEL}-workers-${INDEX}' \
+              --k8s_prefill_selector='rolebasedgroup.workloads.x-k8s.io/role=prefill' \
+              --k8s_decode_selector='rolebasedgroup.workloads.x-k8s.io/role=decode' \
+              --k8s_discovery_interval_seconds=10
+          env:
+          - name: POD_IP
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
+          - name: MC_EVICT_SCAN_THREADS
+            value: "4"
+          - name: MC_EVICT_SCAN_BUCKET_CHUNK
+            value: "4096"
+          - name: NVIDIA_VISIBLE_DEVICES
+            value: "void"
+          securityContext:
+            privileged: true
+            capabilities:
+              add: ["IPC_LOCK", "SYS_RESOURCE"]
+          livenessProbe:
+            exec:
+              command:
+              - /bin/sh
+              - -c
+              - pgrep -x mooncake_master >/dev/null
+            failureThreshold: 3
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            timeoutSeconds: 3
+          ports:
+          - containerPort: 50051
+            name: http
+            protocol: TCP
+          - containerPort: 9003
+            name: metrics
+            protocol: TCP
+        hostNetwork: false
+    workload:
+      apiVersion: apps/v1
+      kind: StatefulSet
+  - name: store-${STORE_SIZE}
+    replicas: ${STORE_REPLICAS}
+    minReadySeconds: 0
+    template:
+      metadata:
+        labels:
+          role: store-${STORE_SIZE}
+          app.kubernetes.io/instance: ${PREFIX}
+          # logtail catch-all 把 store-numa0/numa1 pod 纳入 tail 集,缺则前端日志对 store 为空。
+          app.kubernetes.io/part-of: mooncake
+      spec:
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+              # store 节点 label 统一成单 key kvcache.ai/store + value
+              # <model>_<index>_store-<size>,保证一个节点只属于一个 size。
+              - matchExpressions:
+                - key: kvcache.ai/store
+                  operator: In
+                  values:
+                  - ${MODEL}_${INDEX}_store-${STORE_SIZE}
+          podAntiAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+            # 每节点至多一个 store pod(跨 size):按 part-of=mooncake + 本 group instance
+            # 选中本 group 所有 size 的 store pod,topologyKey=hostname 同节点互斥。
+            - labelSelector:
+                matchExpressions:
+                - key: app.kubernetes.io/part-of
+                  operator: In
+                  values:
+                  - mooncake
+                - key: app.kubernetes.io/instance
+                  operator: In
+                  values:
+                  - ${PREFIX}
+              topologyKey: kubernetes.io/hostname
+        hostNetwork: true
+        dnsPolicy: ClusterFirstWithHostNet
+        containers:
+        - name: store-numa0
+          image: 10.239.34.120:16622/sglang:feat-mooncache_release-72d75a994-mc-dev-c6f71f0
+          imagePullPolicy: IfNotPresent
+          command:
+          - sh
+          - -c
+          - |
+            ulimit -n 1048576
+            ulimit -l unlimited
+            exec numactl --cpunodebind=0 --membind=0 python3 -m mooncake.mooncake_store_service --port=8099
+          env:
+          - name: MOONCAKE_LOCAL_HOSTNAME
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
+          - name: MOONCAKE_MASTER
+            value: "etcd://${PREFIX}-etcd-client.${NS}.svc.cluster.local:2379"
+          - name: MOONCAKE_TE_META_DATA_SERVER
+            value: "P2PHANDSHAKE"
+          - name: MOONCAKE_GLOBAL_SEGMENT_SIZE
+            value: "${STORE_SIZE}"
+          - name: MOONCAKE_LOCAL_BUFFER_SIZE
+            value: "67108864"
+          - name: MOONCAKE_PROTOCOL
+            value: "rdma"
+          - name: MOONCAKE_DEVICE
+            value: "roce_vf_rail0,roce_vf_rail1,roce_vf_rail2,roce_vf_rail3,roce_vf_rail4,roce_vf_rail5,roce_vf_rail6,roce_vf_rail7"
+          - name: MC_ENABLE_DEST_DEVICE_AFFINITY
+            value: "1"
+          # 显式 pin 住 client metrics HTTP server;per-container 分端口 numa0=9300 / numa1=9301
+          # (hostNetwork 下双进程不可同抢 9300,否则输方仅 WARNING 后静默无 endpoint)。
+          - name: MOONCAKE_ENABLE_CLIENT_HTTP_SERVER
+            value: "true"
+          - name: MOONCAKE_CLIENT_HTTP_PORT
+            value: "9300"
+          - name: MC_WORKERS_PER_CTX
+            value: "1"
+          ports:
+          - containerPort: 8099
+          startupProbe:
+            exec:
+              command:
+              - sh
+              - -c
+              - "nc -z 127.0.0.1 8099"
+            periodSeconds: 10
+            failureThreshold: 90
+          livenessProbe:
+            exec:
+              command:
+              - sh
+              - -c
+              - "nc -z 127.0.0.1 8099"
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+          securityContext:
+            capabilities:
+              add: ["IPC_LOCK", "SYS_RESOURCE"]
+            privileged: true
+        - name: store-numa1
+          image: 10.239.34.120:16622/sglang:feat-mooncache_release-72d75a994-mc-dev-c6f71f0
+          imagePullPolicy: IfNotPresent
+          command:
+          - sh
+          - -c
+          - |
+            ulimit -n 1048576
+            ulimit -l unlimited
+            exec numactl --cpunodebind=1 --membind=1 python3 -m mooncake.mooncake_store_service --port=8100
+          env:
+          - name: MOONCAKE_LOCAL_HOSTNAME
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
+          - name: MOONCAKE_MASTER
+            value: "etcd://${PREFIX}-etcd-client.${NS}.svc.cluster.local:2379"
+          - name: MOONCAKE_TE_META_DATA_SERVER
+            value: "P2PHANDSHAKE"
+          - name: MOONCAKE_GLOBAL_SEGMENT_SIZE
+            value: "${STORE_SIZE}"
+          - name: MOONCAKE_LOCAL_BUFFER_SIZE
+            value: "67108864"
+          - name: MOONCAKE_PROTOCOL
+            value: "rdma"
+          - name: MOONCAKE_DEVICE
+            value: "roce_vf_rail0,roce_vf_rail1,roce_vf_rail2,roce_vf_rail3,roce_vf_rail4,roce_vf_rail5,roce_vf_rail6,roce_vf_rail7"
+          - name: MC_ENABLE_DEST_DEVICE_AFFINITY
+            value: "1"
+          - name: MOONCAKE_ENABLE_CLIENT_HTTP_SERVER
+            value: "true"
+          - name: MOONCAKE_CLIENT_HTTP_PORT
+            value: "9301"
+          - name: MC_WORKERS_PER_CTX
+            value: "1"
+          ports:
+          - containerPort: 8100
+          startupProbe:
+            exec:
+              command:
+              - sh
+              - -c
+              - "nc -z 127.0.0.1 8100"
+            periodSeconds: 10
+            failureThreshold: 90
+          livenessProbe:
+            exec:
+              command:
+              - sh
+              - -c
+              - "nc -z 127.0.0.1 8100"
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+          securityContext:
+            capabilities:
+              add: ["IPC_LOCK", "SYS_RESOURCE"]
+            privileged: true
+    # store 切 Deployment:store 无 PVC、hostNetwork + POD_IP 注册,不依赖稳定 pod 名/DNS,
+    # 语义上可用 Deployment。见文件头关于滚动更新 + 独占节点的注意事项。
+    workload:
+      apiVersion: apps/v1
+      kind: Deployment
